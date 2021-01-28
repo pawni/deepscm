@@ -11,23 +11,27 @@ def get_ops(norm_type: str = 'batch', n_dim: int = 2):
         bn_1d_op = nn.InstanceNorm1d
     elif norm_type == 'layer':
         bn_1d_op = nn.LayerNorm
-    elif norm_type == 'none':
+    elif 'none' in norm_type:
         bn_1d_op = nn.Identity
 
     if n_dim == 2:
         conv_op = nn.Conv2d
         conv_transpose_op = nn.ConvTranspose2d
-        if norm_type == 'instance':
+        if 'instance' in norm_type:
             bn_op = nn.InstanceNorm2d
-        else:
+        elif 'batch' in norm_type:
             bn_op = nn.BatchNorm2d
+        else:
+            bn_op = nn.Identity
     elif n_dim == 3:
         conv_op = nn.Conv3d
         conv_transpose_op = nn.ConvTranspose3d
-        if norm_type == 'instance':
+        if 'instance' in norm_type:
             bn_op = nn.InstanceNorm3d
-        else:
+        elif 'batch' in norm_type:
             bn_op = nn.BatchNorm3d
+        else:
+            bn_op = nn.Identity
 
     return bn_1d_op, bn_op, conv_op, conv_transpose_op
 

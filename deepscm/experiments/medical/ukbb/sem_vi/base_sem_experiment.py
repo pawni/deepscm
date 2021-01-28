@@ -294,7 +294,8 @@ class BaseVISEM(BaseSEM):
         parser.add_argument('--dec_filters', default='128,64,32,24,16', type=str, help="number of filters to use (default: %(default)s)")
         parser.add_argument('--num_convolutions', default=3, type=int, help="number of convolutions to build model (default: %(default)s)")
         parser.add_argument('--use_upconv', default=False, action='store_true', help="toggle upconv (default: %(default)s)")
-        parser.add_argument('--norm_type', default='batch', choices=['batch', 'instance', 'layer', 'none'], help="choose norm type (default: %(default)s)")
+        parser.add_argument('--norm_type', default='batch', choices=['batch', 'instance', 'layer', 'none', 'none_batch', 'none_instance'],
+                            help="choose norm type (default: %(default)s)")
         parser.add_argument(
             '--decoder_type', default='fixed_var', help="var type (default: %(default)s)",
             choices=['fixed_var', 'learned_var', 'independent_gaussian', 'sharedvar_multivariate_gaussian', 'multivariate_gaussian',
