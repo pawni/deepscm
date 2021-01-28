@@ -58,7 +58,7 @@ if __name__ == '__main__':
 
     trainer = Trainer.from_argparse_args(lightning_args)
 
-    model = model_class(**vars(model_params))
+    model = model_class(**vars(model_params), crop_size=hparams.crop_size)
     experiment = exp_class(hparams, model)
 
     if not args.validate:

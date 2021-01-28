@@ -146,6 +146,8 @@ class BaseCovariateExperiment(pl.LightningModule):
         self.hparams = hparams
         self.train_batch_size = hparams.train_batch_size
         self.test_batch_size = hparams.test_batch_size
+        self.crop_size = tuple(int(f.strip()) for f in hparams.crop_size.split(','))
+        self.num_workers = hparams.dataloader_workers
 
         if hasattr(hparams, 'num_sample_particles'):
             self.pyro_model._gen_counterfactual = partial(self.pyro_model.counterfactual, num_particles=self.hparams.num_sample_particles)
@@ -169,9 +171,9 @@ class BaseCovariateExperiment(pl.LightningModule):
         train_crop_type = self.hparams.train_crop_type if hasattr(self.hparams, 'train_crop_type') else 'random'
         split_dir = self.hparams.split_dir if hasattr(self.hparams, 'split_dir') else '/vol/biomedic2/np716/data/gemini/ukbb/ventricle_brain/'
         data_dir = self.hparams.data_dir if hasattr(self.hparams, 'data_dir') else '/vol/biomedic2/bglocker/gemini/UKBB/t0/'
-        self.ukbb_train = UKBBDataset(f'{split_dir}/train.csv', base_path=data_dir, crop_type=train_crop_type, downsample=downsample)  # noqa: E501
-        self.ukbb_val = UKBBDataset(f'{split_dir}/val.csv', base_path=data_dir, crop_type='center', downsample=downsample)
-        self.ukbb_test = UKBBDataset(f'{split_dir}/test.csv', base_path=data_dir, crop_type='center', downsample=downsample)
+        self.ukbb_train = UKBBDataset(f'{split_dir}/train.csv', base_path=data_dir, crop_type=train_crop_type, crop_size=self.crop_size, downsample=downsample)  # noqa: E501
+        self.ukbb_val = UKBBDataset(f'{split_dir}/val.csv', base_path=data_dir, crop_type='center', crop_size=self.crop_size, downsample=downsample)
+        self.ukbb_test = UKBBDataset(f'{split_dir}/test.csv', base_path=data_dir, crop_type='center', crop_size=self.crop_size, downsample=downsample)
 
         self.torch_device = self.trainer.root_gpu if self.trainer.on_gpu else self.trainer.root_device
 
@@ -200,10 +202,10 @@ class BaseCovariateExperiment(pl.LightningModule):
         pass
 
     def train_dataloader(self):
-        return DataLoader(self.ukbb_train, batch_size=self.train_batch_size, shuffle=True)
+        return DataLoader(self.ukbb_train, batch_size=self.train_batch_size, shuffle=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
-        self.val_loader = DataLoader(self.ukbb_val, batch_size=self.test_batch_size, shuffle=False)
+        self.val_loader = DataLoader(self.ukbb_val, batch_size=self.test_batch_size, shuffle=False, num_workers=self.num_workers)
         return self.val_loader
 
     def test_dataloader(self):
@@ -349,17 +351,23 @@ class BaseCovariateExperiment(pl.LightningModule):
 
         return samples
 
-    def log_img_grid(self, tag, imgs, normalize=True, save_img=False, **kwargs):
+    def log_img_grid(self, tag, imgs: torch.Tensor, normalize=True, save_img=False, **kwargs):
+        if imgs.dim() == 5:
+            self.log_img_grid(tag, imgs[:, :, imgs.shape[2] // 2], normalize, **kwargs)
+            self.log_img_grid(f'{tag}_3dslice', imgs[:, :, :, imgs.shape[2] // 2], normalize, **kwargs)
+            return
         if save_img:
             p = os.path.join(self.trainer.logger.experiment.log_dir, f'{tag}.png')
             torchvision.utils.save_image(imgs, p)
-        grid = torchvision.utils.make_grid(imgs, normalize=normalize, **kwargs)
+        if not kwargs and imgs.shape[0] < 8:
+            kwargs['nrow'] = imgs.shape[0]
+        grid = torchvision.utils.make_grid(imgs, normalize=normalize, **kwargs, )
         self.logger.experiment.add_image(tag, grid, self.current_epoch)
 
     def get_batch(self, loader):
         batch = next(iter(self.val_loader))
         if self.trainer.on_gpu:
-            batch = self.trainer.accelerator_backend.to_device(batch, self.torch_device)
+            batch = self.trainer.accelerator_backend.to_device(batch)
         return batch
 
     def log_kdes(self, tag, data, save_img=False):
@@ -497,8 +505,8 @@ class BaseCovariateExperiment(pl.LightningModule):
 
     @classmethod
     def add_arguments(cls, parser):
-        parser.add_argument('--data_dir', default="/vol/biomedic2/bglocker/gemini/UKBB/t0/", type=str, help="data dir (default: %(default)s)")  # noqa: E501
-        parser.add_argument('--split_dir', default="/vol/biomedic2/np716/data/gemini/ukbb/ventricle_brain/", type=str, help="split dir (default: %(default)s)")  # noqa: E501
+        parser.add_argument('--data_dir', default="/vol/biobank/12579/brain/rigid_to_mni/images/", type=str, help="data dir (default: %(default)s)")  # noqa: E501
+        parser.add_argument('--split_dir', default="/vol/biomedic2/np716/data/gemini/ukbb/ventricle_brain_new/", type=str, help="split dir (default: %(default)s)")  # noqa: E501
         parser.add_argument('--sample_img_interval', default=10, type=int, help="interval in which to sample and log images (default: %(default)s)")
         parser.add_argument('--train_batch_size', default=64, type=int, help="train batch size (default: %(default)s)")
         parser.add_argument('--test_batch_size', default=64, type=int, help="test batch size (default: %(default)s)")
@@ -507,6 +515,7 @@ class BaseCovariateExperiment(pl.LightningModule):
         parser.add_argument('--pgm_lr', default=5e-3, type=float, help="lr of pgm (default: %(default)s)")
         parser.add_argument('--l2', default=0., type=float, help="weight decay (default: %(default)s)")
         parser.add_argument('--use_amsgrad', default=False, action='store_true', help="use amsgrad? (default: %(default)s)")
-        parser.add_argument('--train_crop_type', default='random', choices=['random', 'center'], help="how to crop training images (default: %(default)s)")
-
+        parser.add_argument('--train_crop_type', default='center', choices=['random', 'center'], help="how to crop training images (default: %(default)s)")
+        parser.add_argument('--crop_size', default='192,192', help="size to which to crop training images (default: %(default)s)")
+        parser.add_argument('--dataloader_workers', default=4, type=int, help="number of workers for data loading (default: %(default)s)")
         return parser

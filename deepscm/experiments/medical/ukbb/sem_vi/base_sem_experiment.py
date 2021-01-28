@@ -17,7 +17,7 @@ from deepscm.arch.medical import Decoder, Encoder
 from deepscm.distributions.transforms.reshape import ReshapeTransform
 from deepscm.distributions.transforms.affine import LowerCholeskyAffine
 
-from deepscm.distributions.deep import DeepMultivariateNormal, DeepIndepNormal, Conv2dIndepNormal, DeepLowRankMultivariateNormal
+from deepscm.distributions.deep import DeepMultivariateNormal, DeepIndepNormal, Conv2dIndepNormal, Conv3dIndepNormal, DeepLowRankMultivariateNormal
 
 import numpy as np
 
@@ -52,10 +52,17 @@ class BaseVISEM(BaseSEM):
     context_dim = 0
 
     def __init__(self, latent_dim: int, logstd_init: float = -5, enc_filters: str = '16,32,64,128', dec_filters: str = '128,64,32,16',
-                 num_convolutions: int = 2, use_upconv: bool = False, decoder_type: str = 'fixed_var', decoder_cov_rank: int = 10, **kwargs):
+                 num_convolutions: int = 2, use_upconv: bool = False, decoder_type: str = 'fixed_var', decoder_cov_rank: int = 10,
+                 crop_size=(192, 192), norm_type: str = 'batch', **kwargs):
         super().__init__(**kwargs)
 
-        self.img_shape = (1, 192 // self.downsample, 192 // self.downsample) if self.downsample > 0 else (1, 192, 192)
+        crop_size = tuple(int(f.strip()) for f in crop_size.split(','))
+        self.img_shape = tuple(d // self.downsample for d in crop_size) if self.downsample > 0 else crop_size
+
+        self.img_shape = tuple([1] + list(self.img_shape))
+
+        self.n_dim = len(crop_size)
+        indep_normal_cls = Conv2dIndepNormal if self.n_dim == 2 else Conv3dIndepNormal
 
         self.latent_dim = latent_dim
         self.logstd_init = logstd_init
@@ -64,6 +71,7 @@ class BaseVISEM(BaseSEM):
         self.dec_filters = tuple(int(f.strip()) for f in dec_filters.split(','))
         self.num_convolutions = num_convolutions
         self.use_upconv = use_upconv
+        self.norm_type = norm_type
         self.decoder_type = decoder_type
         self.decoder_cov_rank = decoder_cov_rank
 
@@ -71,10 +79,10 @@ class BaseVISEM(BaseSEM):
         decoder = Decoder(
             num_convolutions=self.num_convolutions, filters=self.dec_filters,
             latent_dim=self.latent_dim + self.context_dim, upconv=self.use_upconv,
-            output_size=self.img_shape)
+            output_size=self.img_shape, norm_type=self.norm_type)
 
         if self.decoder_type == 'fixed_var':
-            self.decoder = Conv2dIndepNormal(decoder, 1, 1)
+            self.decoder = indep_normal_cls(decoder, 1, 1)
 
             torch.nn.init.zeros_(self.decoder.logvar_head.weight)
             self.decoder.logvar_head.weight.requires_grad = False
@@ -82,7 +90,7 @@ class BaseVISEM(BaseSEM):
             torch.nn.init.constant_(self.decoder.logvar_head.bias, self.logstd_init)
             self.decoder.logvar_head.bias.requires_grad = False
         elif self.decoder_type == 'learned_var':
-            self.decoder = Conv2dIndepNormal(decoder, 1, 1)
+            self.decoder = indep_normal_cls(decoder, 1, 1)
 
             torch.nn.init.zeros_(self.decoder.logvar_head.weight)
             self.decoder.logvar_head.weight.requires_grad = False
@@ -90,7 +98,7 @@ class BaseVISEM(BaseSEM):
             torch.nn.init.constant_(self.decoder.logvar_head.bias, self.logstd_init)
             self.decoder.logvar_head.bias.requires_grad = True
         elif self.decoder_type == 'independent_gaussian':
-            self.decoder = Conv2dIndepNormal(decoder, 1, 1)
+            self.decoder = indep_normal_cls(decoder, 1, 1)
 
             torch.nn.init.zeros_(self.decoder.logvar_head.weight)
             self.decoder.logvar_head.weight.requires_grad = True
@@ -131,7 +139,9 @@ class BaseVISEM(BaseSEM):
             raise ValueError('unknown  ')
 
         # encoder parts
-        self.encoder = Encoder(num_convolutions=self.num_convolutions, filters=self.enc_filters, latent_dim=self.latent_dim, input_size=self.img_shape)
+        self.encoder = Encoder(
+            num_convolutions=self.num_convolutions, filters=self.enc_filters, latent_dim=self.latent_dim,
+            input_size=self.img_shape, norm_type=self.norm_type)
 
         latent_layers = torch.nn.Sequential(torch.nn.Linear(self.latent_dim + self.context_dim, self.latent_dim), torch.nn.ReLU())
         self.latent_encoder = DeepIndepNormal(latent_layers, self.latent_dim, self.latent_dim)
@@ -197,7 +207,7 @@ class BaseVISEM(BaseSEM):
 
     def _get_transformed_x_dist(self, latent):
         x_pred_dist = self.decoder.predict(latent)
-        x_base_dist = Normal(self.x_base_loc, self.x_base_scale).to_event(3)
+        x_base_dist = Normal(self.x_base_loc, self.x_base_scale).to_event(self.n_dim + 1)
 
         preprocess_transform = self._get_preprocess_transforms()
 
@@ -207,7 +217,7 @@ class BaseVISEM(BaseSEM):
             x_reparam_transform = ComposeTransform([reshape_transform, chol_transform, reshape_transform.inv])
         elif isinstance(x_pred_dist, Independent):
             x_pred_dist = x_pred_dist.base_dist
-            x_reparam_transform = AffineTransform(x_pred_dist.loc, x_pred_dist.scale, 3)
+            x_reparam_transform = AffineTransform(x_pred_dist.loc, x_pred_dist.scale, self.n_dim + 1)
 
         return TransformedDistribution(x_base_dist, ComposeTransform([x_reparam_transform, preprocess_transform]))
 
@@ -283,7 +293,8 @@ class BaseVISEM(BaseSEM):
         parser.add_argument('--enc_filters', default='16,24,32,64,128', type=str, help="number of filters to use (default: %(default)s)")
         parser.add_argument('--dec_filters', default='128,64,32,24,16', type=str, help="number of filters to use (default: %(default)s)")
         parser.add_argument('--num_convolutions', default=3, type=int, help="number of convolutions to build model (default: %(default)s)")
-        parser.add_argument('--use_upconv', default=False, action='store_true', help="toogle upconv (default: %(default)s)")
+        parser.add_argument('--use_upconv', default=False, action='store_true', help="toggle upconv (default: %(default)s)")
+        parser.add_argument('--norm_type', default='batch', choices=['batch', 'instance', 'layer', 'none'], help="choose norm type (default: %(default)s)")
         parser.add_argument(
             '--decoder_type', default='fixed_var', help="var type (default: %(default)s)",
             choices=['fixed_var', 'learned_var', 'independent_gaussian', 'sharedvar_multivariate_gaussian', 'multivariate_gaussian',
