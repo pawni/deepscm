@@ -313,16 +313,17 @@ class SVIExperiment(BaseCovariateExperiment):
 
         self._build_svi()
 
-    def _build_svi(self, loss=None):
-        def per_param_callable(module_name, param_name):
-            params = {'eps': 1e-5, 'amsgrad': self.hparams.use_amsgrad, 'weight_decay': self.hparams.l2}
-            if 'flow_components' in module_name or 'sex_logits' in param_name:
-                params['lr'] = self.hparams.pgm_lr
-            else:
-                params['lr'] = self.hparams.lr
+    def _svi_per_param_callable(self, module_name, param_name):
+        params = {'eps': 1e-5, 'amsgrad': self.hparams.use_amsgrad, 'weight_decay': self.hparams.l2}
+        if 'flow_components' in module_name or 'sex_logits' in param_name:
+            params['lr'] = self.hparams.pgm_lr
+        else:
+            params['lr'] = self.hparams.lr
 
-            print(f'building opt for {module_name} - {param_name} with p: {params}')
-            return params
+        print(f'building opt for {module_name} - {param_name} with p: {params}')
+        return params
+
+    def _build_svi(self, loss=None):
 
         if loss is None:
             loss = self.svi_loss
@@ -330,9 +331,9 @@ class SVIExperiment(BaseCovariateExperiment):
         if self.hparams.use_cf_guide:
             def guide(*args, **kwargs):
                 return self.pyro_model.counterfactual_guide(*args, **kwargs, counterfactual_type=self.hparams.cf_elbo_type)
-            self.svi = SVI(self.pyro_model.svi_model, guide, Adam(per_param_callable), loss)
+            self.svi = SVI(self.pyro_model.svi_model, guide, Adam(self._svi_per_param_callable), loss)
         else:
-            self.svi = SVI(self.pyro_model.svi_model, self.pyro_model.svi_guide, Adam(per_param_callable), loss)
+            self.svi = SVI(self.pyro_model.svi_model, self.pyro_model.svi_guide, Adam(self._svi_per_param_callable), loss)
         self.svi.loss_class = loss
 
     def backward(self, *args, **kwargs):

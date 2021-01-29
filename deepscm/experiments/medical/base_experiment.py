@@ -148,6 +148,7 @@ class BaseCovariateExperiment(pl.LightningModule):
         self.test_batch_size = hparams.test_batch_size
         self.crop_size = tuple(int(f.strip()) for f in hparams.crop_size.split(','))
         self.num_workers = hparams.dataloader_workers
+        self.prepared_validation_conditions = False
 
         if hasattr(hparams, 'num_sample_particles'):
             self.pyro_model._gen_counterfactual = partial(self.pyro_model.counterfactual, num_particles=self.hparams.num_sample_particles)
@@ -175,28 +176,30 @@ class BaseCovariateExperiment(pl.LightningModule):
         self.ukbb_val = UKBBDataset(f'{split_dir}/val.csv', base_path=data_dir, crop_type='center', crop_size=self.crop_size, downsample=downsample)
         self.ukbb_test = UKBBDataset(f'{split_dir}/test.csv', base_path=data_dir, crop_type='center', crop_size=self.crop_size, downsample=downsample)
 
-        self.torch_device = self.trainer.root_gpu if self.trainer.on_gpu else self.trainer.root_device
+        self.pyro_model.age_flow_lognorm_loc.copy_(self.ukbb_train.metrics['age'].log().mean().float())
+        self.pyro_model.age_flow_lognorm_scale.copy_(self.ukbb_train.metrics['age'].log().std().float())
 
-        # TODO: change ranges and decide what to condition on
-        brain_volumes = 800000. + 300000 * torch.arange(3, dtype=torch.float, device=self.torch_device)
-        self.brain_volume_range = brain_volumes.repeat(3).unsqueeze(1)
-        ventricle_volumes = 10000. + 50000 * torch.arange(3, dtype=torch.float, device=self.torch_device)
-        self.ventricle_volume_range = ventricle_volumes.repeat_interleave(3).unsqueeze(1)
-        self.z_range = torch.randn([1, self.hparams.latent_dim], device=self.torch_device, dtype=torch.float).repeat((9, 1))
+        self.pyro_model.ventricle_volume_flow_lognorm_loc.copy_(self.ukbb_train.metrics['ventricle_volume'].log().mean().float())
+        self.pyro_model.ventricle_volume_flow_lognorm_scale.copy_(self.ukbb_train.metrics['ventricle_volume'].log().std().float())
 
-        self.pyro_model.age_flow_lognorm_loc = (self.ukbb_train.metrics['age'].log().mean().to(self.torch_device).float())
-        self.pyro_model.age_flow_lognorm_scale = (self.ukbb_train.metrics['age'].log().std().to(self.torch_device).float())
-
-        self.pyro_model.ventricle_volume_flow_lognorm_loc = (self.ukbb_train.metrics['ventricle_volume'].log().mean().to(self.torch_device).float())
-        self.pyro_model.ventricle_volume_flow_lognorm_scale = (self.ukbb_train.metrics['ventricle_volume'].log().std().to(self.torch_device).float())
-
-        self.pyro_model.brain_volume_flow_lognorm_loc = (self.ukbb_train.metrics['brain_volume'].log().mean().to(self.torch_device).float())
-        self.pyro_model.brain_volume_flow_lognorm_scale = (self.ukbb_train.metrics['brain_volume'].log().std().to(self.torch_device).float())
+        self.pyro_model.brain_volume_flow_lognorm_loc.copy_(self.ukbb_train.metrics['brain_volume'].log().mean().float())
+        self.pyro_model.brain_volume_flow_lognorm_scale.copy_(self.ukbb_train.metrics['brain_volume'].log().std().float())
 
         if self.hparams.validate:
             print(f'set ventricle_volume_flow_lognorm {self.pyro_model.ventricle_volume_flow_lognorm.loc} +/- {self.pyro_model.ventricle_volume_flow_lognorm.scale}')  # noqa: E501
             print(f'set age_flow_lognorm {self.pyro_model.age_flow_lognorm.loc} +/- {self.pyro_model.age_flow_lognorm.scale}')
             print(f'set brain_volume_flow_lognorm {self.pyro_model.brain_volume_flow_lognorm.loc} +/- {self.pyro_model.brain_volume_flow_lognorm.scale}')
+
+    def prep_validation_conditions(self, type_tensor: torch.Tensor):
+        # TODO: change ranges and decide what to condition on
+        if not self.prepared_validation_conditions:
+            brain_volumes = 800000. + 300000 * torch.arange(3).type_as(type_tensor)
+            self.brain_volume_range = brain_volumes.repeat(3).unsqueeze(1)
+            ventricle_volumes = 10000. + 50000 * torch.arange(3).type_as(type_tensor)
+            self.ventricle_volume_range = ventricle_volumes.repeat_interleave(3).unsqueeze(1)
+            self.z_range = torch.randn([1, self.hparams.latent_dim]).type_as(type_tensor).repeat((9, 1))
+
+            self.prepared_validation_conditions = True
 
     def configure_optimizers(self):
         pass
@@ -239,6 +242,8 @@ class BaseCovariateExperiment(pl.LightningModule):
         outputs = self.assemble_epoch_end_outputs(outputs)
 
         samples = outputs.pop('samples')
+
+        self.prep_validation_conditions(samples)
 
         sample_trace = pyro.poutine.trace(self.pyro_model.sample).get_trace(self.hparams.test_batch_size)
         samples['unconditional_samples'] = {
@@ -359,15 +364,14 @@ class BaseCovariateExperiment(pl.LightningModule):
         if save_img:
             p = os.path.join(self.trainer.logger.experiment.log_dir, f'{tag}.png')
             torchvision.utils.save_image(imgs, p)
-        if not kwargs and imgs.shape[0] < 8:
-            kwargs['nrow'] = imgs.shape[0]
+        if not kwargs and self.hparams.test_batch_size < 8:
+            kwargs['nrow'] = self.hparams.test_batch_size
         grid = torchvision.utils.make_grid(imgs, normalize=normalize, **kwargs, )
         self.logger.experiment.add_image(tag, grid, self.current_epoch)
 
     def get_batch(self, loader):
         batch = next(iter(self.val_loader))
-        if self.trainer.on_gpu:
-            batch = self.trainer.accelerator_backend.to_device(batch)
+
         return batch
 
     def log_kdes(self, tag, data, save_img=False):
@@ -394,11 +398,16 @@ class BaseCovariateExperiment(pl.LightningModule):
 
         sns.despine()
 
-        if save_img:
-            p = os.path.join(self.trainer.logger.experiment.log_dir, f'{tag}.png')
-            plt.savefig(p, dpi=300)
-
         self.logger.experiment.add_figure(tag, fig, self.current_epoch)
+
+        if save_img:
+            log_dir_path = self.trainer.logger.experiment.log_dir
+            if callable(self.trainer.logger.experiment.log_dir):
+                log_dir_path = self.trainer.logger.experiment.log_dir()
+            if log_dir_path is None:
+                return
+            p = os.path.join(log_dir_path, f'{tag}.png')
+            plt.savefig(p, dpi=300)
 
     def build_reconstruction(self, x, age, sex, ventricle_volume, brain_volume, tag='reconstruction'):
         obs = {'x': x, 'age': age, 'sex': sex, 'ventricle_volume': ventricle_volume, 'brain_volume': brain_volume}
@@ -436,7 +445,7 @@ class BaseCovariateExperiment(pl.LightningModule):
                 sampled_kdes[name] = {'brain_volume': sampled_brain_volume, 'ventricle_volume': sampled_ventricle_volume}
 
         self.log_img_grid(tag, torch.cat(imgs, 0))
-        self.log_kdes(f'{tag}_sampled', sampled_kdes, save_img=True)
+        self.log_kdes(f'{tag}_sampled', sampled_kdes, save_img=False)
 
     def sample_images(self):
         with torch.no_grad():
@@ -447,19 +456,21 @@ class BaseCovariateExperiment(pl.LightningModule):
             sampled_brain_volume = sample_trace.nodes['brain_volume']['value']
             sampled_ventricle_volume = sample_trace.nodes['ventricle_volume']['value']
 
+            self.prep_validation_conditions(samples)
+
             self.log_img_grid('samples', samples.data[:8])
 
             cond_data = {'brain_volume': self.brain_volume_range, 'ventricle_volume': self.ventricle_volume_range, 'z': self.z_range}
             samples, *_ = pyro.condition(self.pyro_model.sample, data=cond_data)(9)
             self.log_img_grid('cond_samples', samples.data, nrow=3)
 
-            obs_batch = self.prep_batch(self.get_batch(self.val_loader))
+            obs_batch = self.prep_batch({k: v.type_as(samples) for k, v in self.get_batch(self.val_loader).items()})
 
             kde_data = {
                 'batch': {'brain_volume': obs_batch['brain_volume'], 'ventricle_volume': obs_batch['ventricle_volume']},
                 'sampled': {'brain_volume': sampled_brain_volume, 'ventricle_volume': sampled_ventricle_volume}
             }
-            self.log_kdes('sample_kde', kde_data, save_img=True)
+            self.log_kdes('sample_kde', kde_data, save_img=False)
 
             exogeneous = self.pyro_model.infer(**obs_batch)
 
@@ -468,7 +479,7 @@ class BaseCovariateExperiment(pl.LightningModule):
 
             obs_batch = {k: v[:8] for k, v in obs_batch.items()}
 
-            self.log_img_grid('input', obs_batch['x'], save_img=True)
+            self.log_img_grid('input', obs_batch['x'], save_img=False)
 
             if hasattr(self.pyro_model, 'reconstruct'):
                 self.build_reconstruction(**obs_batch)

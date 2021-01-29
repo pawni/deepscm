@@ -32,6 +32,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args(other_args)
 
+    print(f'Got gpu args: {args.gpus}')
     if args.gpus is not None and isinstance(args.gpus, int):
         # Make sure that it only uses a single GPU..
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpus)
