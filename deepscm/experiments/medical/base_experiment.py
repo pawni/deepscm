@@ -46,7 +46,7 @@ class BaseSEM(PyroModule):
             a1 = AffineTransform(0., (1. / 2 ** num_bits))
 
             # Map into unconstrained space as done in RealNVP
-            a2 = AffineTransform(alpha, (1 - alpha))
+            a2 = AffineTransform(alpha, (1 - 2 * alpha))
 
             s = SigmoidTransform()
 
