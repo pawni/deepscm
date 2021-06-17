@@ -1,5 +1,6 @@
 import torch
 import pyro
+import numpy as np
 
 from pyro.nn import pyro_method
 from pyro.distributions import Normal, TransformedDistribution
@@ -10,6 +11,7 @@ from pyro.distributions.torch_transform import ComposeTransformModule
 from pyro.distributions.conditional import ConditionalTransformedDistribution
 from deepscm.distributions.transforms.affine import ConditionalAffineTransform
 from pyro.nn import DenseNN
+import deepscm.pyro_addons.messengers
 
 from .base_sem_experiment import BaseVISEM, MODEL_REGISTRY
 
@@ -17,8 +19,16 @@ from .base_sem_experiment import BaseVISEM, MODEL_REGISTRY
 class ConditionalVISEM(BaseVISEM):
     context_dim = 2
 
-    def __init__(self, **kwargs):
+    def __init__(self, independence_weighting: bool = False, independence_samples: int = 16, weight_z: bool = False, **kwargs):
         super().__init__(**kwargs)
+
+        self.independence_weighting = independence_weighting
+        self.independence_samples = independence_samples
+        self.weight_z = weight_z
+
+        self.intensity_cache = None
+        self.thickness_cache = None
+        self.weight_cache = None
 
         # Flow for modelling t Gamma
         self.thickness_flow_components = ComposeTransformModule([Spline(1)])
@@ -82,6 +92,57 @@ class ConditionalVISEM(BaseVISEM):
 
         return z
 
+    @pyro.poutine.block()
+    @torch.no_grad()
+    def calc_scale_dict(self, thickness, intensity):
+        if self.weight_cache is not None and torch.equal(self.intensity_cache, intensity) and torch.equal(self.thickness_cache, thickness):
+            return self.weight_cache
+
+        data_dict = {'thickness': thickness, 'intensity': intensity}
+        orig_trace = pyro.poutine.trace(self.conditioned_pgm_model).get_trace(**data_dict)
+        orig_trace.compute_log_prob()
+        log_prob = orig_trace.nodes['intensity']['log_prob']
+
+        data_dict['thickness'] = torch.stack(
+            [thickness[np.random.permutation(thickness.shape[0])] for _ in range(self.independence_samples)])
+        data_dict['intensity'] = torch.stack(
+            [intensity for _ in range(self.independence_samples)])
+
+        data_dict['thickness'] = data_dict['thickness'].view([-1, 1])
+        data_dict['intensity'] = data_dict['intensity'].view([-1, 1])
+
+        marginal_trace = pyro.poutine.trace(self.conditioned_pgm_model).get_trace(**data_dict)
+        marginal_trace.compute_log_prob()
+        marginal_intensity = marginal_trace.nodes['intensity']['log_prob'].view([self.independence_samples, -1]).mean(0)
+
+        weights = torch.exp(marginal_intensity - log_prob)
+
+        weight_dict = {'x': weights}
+        if self.weight_z:
+            weight_dict['z'] = weights
+
+        self.thickness_cache = thickness
+        self.intensity_cache = intensity
+        self.weight_cache = weight_dict
+
+        return weight_dict
+
+    @pyro_method
+    def svi_model(self, x, thickness, intensity):
+        if self.independence_weighting:
+            scale_dict = self.calc_scale_dict(thickness, intensity)
+            deepscm.pyro_addons.messengers.site_scale_messenger(super().svi_model(x, thickness, intensity), scale_dict=scale_dict)
+        else:
+            super().svi_model(x, thickness, intensity)
+
+    @pyro_method
+    def svi_guide(self, x, thickness, intensity):
+        if self.independence_weighting and self.weight_z:
+            scale_dict = self.calc_scale_dict(thickness, intensity)
+            deepscm.pyro_addons.messengers.site_scale_messenger(super().svi_guide(x, thickness, intensity), scale_dict=scale_dict)
+        else:
+            super().svi_guide(x, thickness, intensity)
+
     @pyro_method
     def infer_thickness_base(self, thickness):
         return self.thickness_flow_transforms.inv(thickness)
@@ -92,6 +153,15 @@ class ConditionalVISEM(BaseVISEM):
         cond_intensity_transforms = ComposeTransform(
             ConditionalTransformedDistribution(intensity_base_dist, self.intensity_flow_transforms).condition(thickness).transforms)
         return cond_intensity_transforms.inv(intensity)
+
+    @classmethod
+    def add_arguments(cls, parser):
+        parser = super().add_arguments(parser)
+
+        parser.add_argument('--independence_weighting', default=False, action='store_true', help="Reweights loss to encourage independence.")
+        parser.add_argument('--independence_samples', default=16, type=int, help="Number of samples to calculate marginal distribution.")
+        parser.add_argument('--weight_z', default=False, action='store_true', help="Reweights loss on z to encourage independence.")
+        return parser
 
 
 MODEL_REGISTRY[ConditionalVISEM.__name__] = ConditionalVISEM

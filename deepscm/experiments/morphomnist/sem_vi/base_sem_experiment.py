@@ -249,6 +249,11 @@ class BaseVISEM(BaseSEM):
             counterfactuals += [counter]
         return {k: v for k, v in zip(('x', 'z', 'thickness', 'intensity'), (torch.stack(c).mean(0) for c in zip(*counterfactuals)))}
 
+    @pyro_method
+    def conditioned_pgm_model(self, thickness, intensity):
+        with pyro.plate('observations', thickness.shape[0]):
+            pyro.condition(self.model, data={'thickness': thickness, 'intensity': intensity})()
+
     @classmethod
     def add_arguments(cls, parser):
         parser = super().add_arguments(parser)
