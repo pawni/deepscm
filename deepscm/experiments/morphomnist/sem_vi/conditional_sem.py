@@ -19,12 +19,14 @@ from .base_sem_experiment import BaseVISEM, MODEL_REGISTRY
 class ConditionalVISEM(BaseVISEM):
     context_dim = 2
 
-    def __init__(self, independence_weighting: bool = False, independence_samples: int = 16, weight_z: bool = False, **kwargs):
+    def __init__(self, independence_weighting: bool = False, independence_samples: int = 16,
+                 weight_z: bool = False, auxiliary_models: bool = False, **kwargs):
         super().__init__(**kwargs)
 
         self.independence_weighting = independence_weighting
         self.independence_samples = independence_samples
         self.weight_z = weight_z
+        self.auxiliary_models = auxiliary_models
 
         self.intensity_cache = None
         self.thickness_cache = None
@@ -40,6 +42,35 @@ class ConditionalVISEM(BaseVISEM):
         self.intensity_flow_components = ConditionalAffineTransform(context_nn=intensity_net, event_dim=0)
         self.intensity_flow_constraint_transforms = ComposeTransform([SigmoidTransform(), self.intensity_flow_norm])
         self.intensity_flow_transforms = [self.intensity_flow_components, self.intensity_flow_constraint_transforms]
+
+        if self.auxiliary_models:
+            self.aux_thickness = torch.nn.Sequential(
+                torch.nn.Conv2d(1, 8, 3, 1, 1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(8, 16, 3, 2, 1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(16, 32, 3, 1, 1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(32, 64, 3, 2, 1),
+                torch.nn.ReLU(),
+                torch.nn.AdaptiveAvgPool2d((1, 1)),
+                torch.nn.Flatten(),
+                torch.nn.Linear(64, 1)
+            )
+
+            self.aux_intensity = torch.nn.Sequential(
+                torch.nn.Conv2d(1, 8, 3, 1, 1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(8, 16, 3, 2, 1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(16, 32, 3, 1, 1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(32, 64, 3, 2, 1),
+                torch.nn.ReLU(),
+                torch.nn.AdaptiveAvgPool2d((1, 1)),
+                torch.nn.Flatten(),
+                torch.nn.Linear(64, 1)
+            )
 
     @pyro_method
     def pgm_model(self):
@@ -76,6 +107,21 @@ class ConditionalVISEM(BaseVISEM):
         x = pyro.sample('x', x_dist)
 
         return x, z, thickness, intensity
+
+    @pyro_method
+    def aux_model(self, x):
+        aux_thickness = pyro.sample('aux_thickness', Normal(self.aux_thickness(x), 1))
+        aux_intensity = pyro.sample('aux_intensity', Normal(self.aux_intensity(x), 1))
+
+        return aux_thickness, aux_intensity
+
+    @pyro_method
+    def counterfactual_aux_model(self, x, thickness, intensity):
+        counterfactual = self.get_training_counterfactual(x, thickness, intensity)
+
+        conditioning = {'aux_thickness': counterfactual['thickness'], 'aux_intensity': counterfactual['intensity']}
+        with pyro.plate('observations', x.shape[0]):
+            pyro.condition(self.aux_model, data=conditioning)(counterfactual['x'])
 
     @pyro_method
     def guide(self, x, thickness, intensity):
@@ -129,11 +175,19 @@ class ConditionalVISEM(BaseVISEM):
 
     @pyro_method
     def svi_model(self, x, thickness, intensity):
+        model_fn = super().svi_model
+        if self.auxiliary_models:
+            def model_fn(x, thickness, intensity):
+                with pyro.plate('observations', x.shape[0]):
+                    pyro.condition(self.model, data={'x': x, 'thickness': thickness, 'intensity': intensity})()
+
+                    pyro.condition(self.aux_model, data={'aux_thickness': thickness, 'aux_intensity': intensity})(x)
+
         if self.independence_weighting:
             scale_dict = self.calc_scale_dict(thickness, intensity)
-            deepscm.pyro_addons.messengers.site_scale_messenger(super().svi_model(x, thickness, intensity), scale_dict=scale_dict)
+            deepscm.pyro_addons.messengers.site_scale_messenger(model_fn(x, thickness, intensity), scale_dict=scale_dict)
         else:
-            super().svi_model(x, thickness, intensity)
+            model_fn(x, thickness, intensity)
 
     @pyro_method
     def svi_guide(self, x, thickness, intensity):
@@ -161,6 +215,7 @@ class ConditionalVISEM(BaseVISEM):
         parser.add_argument('--independence_weighting', default=False, action='store_true', help="Reweights loss to encourage independence.")
         parser.add_argument('--independence_samples', default=16, type=int, help="Number of samples to calculate marginal distribution.")
         parser.add_argument('--weight_z', default=False, action='store_true', help="Reweights loss on z to encourage independence.")
+        parser.add_argument('--auxiliary_models', default=False, action='store_true', help="Use auxiliary models to enforce parent values.")
         return parser
 
 

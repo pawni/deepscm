@@ -50,7 +50,8 @@ class BaseVISEM(BaseSEM):
     context_dim = 0
     img_shape = (1, 28, 28)
 
-    def __init__(self, hidden_dim: int, latent_dim: int, logstd_init: float = -5, decoder_type: str = 'fixed_var', decoder_cov_rank: int = 10, **kwargs):
+    def __init__(self, hidden_dim: int, latent_dim: int, logstd_init: float = -5,
+                 decoder_type: str = 'fixed_var', decoder_cov_rank: int = 10, **kwargs):
         super().__init__(**kwargs)
 
         self.hidden_dim = hidden_dim
@@ -171,7 +172,7 @@ class BaseVISEM(BaseSEM):
         self.guide(x, thickness, intensity)
 
     @pyro_method
-    def counterfactual_guide(self, x, thickness, intensity, counterfactual_type=-1):
+    def get_training_counterfactual(self, x, thickness, intensity, counterfactual_type=-1):
         if counterfactual_type == -1:
             counterfactual_type = np.random.randint(0, 3)
 
@@ -191,11 +192,16 @@ class BaseVISEM(BaseSEM):
                 raise ValueError('counterfactual_type needs to be in [0, 1, 2] but got {}'.format(counterfactual_type))
 
             # get counterfactual
-            counterfactual = self.counterfactual(obs=obs, condition=condition, num_particles=1)
+            counterfactual = self.counterfactual(obs=obs, condition=condition, num_particles=1, detach=False)
 
         # run normal guide
         counterfactual.pop('z', None)
 
+        return counterfactual
+
+    @pyro_method
+    def counterfactual_guide(self, x, thickness, intensity, counterfactual_type=-1):
+        counterfactual = self.get_training_counterfactual(x, thickness, intensity, counterfactual_type)
         return self.guide(**counterfactual)
 
     @pyro_method
@@ -232,7 +238,7 @@ class BaseVISEM(BaseSEM):
         return torch.stack(recons).mean(0)
 
     @pyro_method
-    def counterfactual(self, obs: Mapping, condition: Mapping = None, num_particles: int = 1):
+    def counterfactual(self, obs: Mapping, condition: Mapping = None, num_particles: int = 1, detach: bool = True):
         _required_data = ('x', 'thickness', 'intensity')
         assert set(obs.keys()) == set(_required_data), 'got: {}'.format(tuple(obs.keys()))
 
@@ -243,7 +249,7 @@ class BaseVISEM(BaseSEM):
             z = pyro.sample('z', z_dist)
 
             exogeneous = self.infer_exogeneous(z=z, **obs)
-            exogeneous = {k: v.detach() for k, v in exogeneous.items()}
+            exogeneous = {k: v.detach() if detach else v for k, v in exogeneous.items()}
             exogeneous['z'] = z
             counter = pyro.poutine.do(pyro.poutine.condition(self.sample_scm, data=exogeneous), data=condition)(obs['x'].shape[0])
             counterfactuals += [counter]
@@ -271,7 +277,7 @@ class BaseVISEM(BaseSEM):
 
 
 class SVIExperiment(BaseCovariateExperiment):
-    def __init__(self, hparams, pyro_model: BaseSEM):
+    def __init__(self, hparams, pyro_model: BaseSEM, aux_loss_weight: float = 1.):
         super().__init__(hparams, pyro_model)
 
         self.svi_loss = CustomELBO(num_particles=hparams.num_svi_particles)
@@ -358,6 +364,10 @@ class SVIExperiment(BaseCovariateExperiment):
         metrics['q(z)'] = guide.nodes['z']['log_prob'].mean()
         metrics['log p(z) - log q(z)'] = metrics['p(z)'] - metrics['q(z)']
 
+        if 'aux_intensity' in model.nodes:
+            metrics['log p_aux(intensity|x)'] = model.nodes['aux_intensity']['log_prob'].mean()
+            metrics['log p_aux(thickness|x)'] = model.nodes['aux_thickness']['log_prob'].mean()
+
         return metrics
 
     def prep_batch(self, batch):
@@ -374,6 +384,29 @@ class SVIExperiment(BaseCovariateExperiment):
 
         return {'x': x, 'thickness': thickness, 'intensity': intensity}
 
+    def counterfactual_aux_training(self, batch):
+        self.pyro_model.aux_thickness.requires_grad_(False)
+        self.pyro_model.aux_intensity.requires_grad_(False)
+        with pyro.poutine.trace(param_only=True) as param_capture:
+            trace = pyro.poutine.trace(self.pyro_model.counterfactual_aux_model).get_trace(**batch)
+            trace.compute_log_prob()
+
+            logprob = trace.nodes['aux_thickness']['log_prob_sum'] + trace.nodes['aux_intensity']['log_prob_sum']
+            aux_loss = -logprob * self.hparams.aux_loss_weight
+            aux_loss.backward()
+
+        params = set(site["value"].unconstrained()
+                     for site in param_capture.trace.nodes.values())
+        self.svi.optim(params)
+
+        # zero gradients
+        pyro.infer.util.zero_grads(params)
+
+        self.pyro_model.aux_thickness.requires_grad_(True)
+        self.pyro_model.aux_intensity.requires_grad_(True)
+
+        return aux_loss
+
     def training_step(self, batch, batch_idx):
         batch = self.prep_batch(batch)
 
@@ -383,6 +416,9 @@ class SVIExperiment(BaseCovariateExperiment):
 
         loss = self.svi.step(**batch)
 
+        if self.pyro_model.__dict__.get('auxiliary_models'):
+            aux_loss = self.counterfactual_aux_training(batch)
+
         metrics = self.get_trace_metrics(batch)
 
         if np.isnan(loss):
@@ -391,6 +427,8 @@ class SVIExperiment(BaseCovariateExperiment):
 
         tensorboard_logs = {('train/' + k): v for k, v in metrics.items()}
         tensorboard_logs['train/loss'] = loss
+        if self.pyro_model.__dict__.get('auxiliary_models'):
+            tensorboard_logs['train/aux_loss'] = aux_loss.item()
 
         self.log_dict(tensorboard_logs)
 
@@ -426,6 +464,7 @@ class SVIExperiment(BaseCovariateExperiment):
         parser.add_argument(
             '--cf_elbo_type', default=-1, choices=[-1, 0, 1, 2],
             help="-1: randomly select per batch, 0: shuffle thickness, 1: shuffle intensity, 2: shuffle both (default: %(default)s)")
+        parser.add_argument('--aux_loss_weight', default=1., type=float, help="Weight for auxiliary loss (default: %(default)s)")
 
         return parser
 
